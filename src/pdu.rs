@@ -367,6 +367,35 @@ pub(crate) fn push_varbinds(buf: &mut Buf, values: &[(&Oid, Value)]) {
     });
 }
 
+pub(crate) fn varbinds_from_vec(values: &[(Oid, Value)]) -> Vec<u8> {
+    let mut buf = Buf::default();
+    for (oid, val) in values.iter().rev() {
+        buf.push_sequence(|buf| {
+            match val {
+                Value::Boolean(b) => buf.push_boolean(*b),
+                Value::Null => buf.push_null(),
+                Value::Integer(i) => buf.push_integer(*i),
+                Value::OctetString(ostr) => buf.push_octet_string(ostr),
+                Value::ObjectIdentifier(ref objid) => {
+                    buf.push_object_identifier_raw(objid.as_bytes());
+                }
+                Value::IpAddress(ip) => buf.push_ipaddress(*ip),
+                Value::Counter32(i) => buf.push_counter32(*i),
+                Value::Unsigned32(i) => buf.push_unsigned32(*i),
+                Value::Timeticks(tt) => buf.push_timeticks(*tt),
+                Value::Opaque(bytes) => buf.push_opaque(bytes),
+                Value::Counter64(i) => buf.push_counter64(*i),
+                Value::EndOfMibView => buf.push_endofmibview(),
+                Value::NoSuchObject => buf.push_nosuchobject(),
+                Value::NoSuchInstance => buf.push_nosuchinstance(),
+                _ => return,
+            }
+            buf.push_object_identifier_raw(oid.as_bytes());
+        });
+    }
+    buf.to_vec()
+}
+
 #[inline]
 pub(crate) fn build_inner(
     req_id: i32,
@@ -503,7 +532,7 @@ pub(crate) fn build_set(
     )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Pdu<'a> {
     pub(crate) version: i64,
     pub community: &'a [u8],
@@ -517,6 +546,26 @@ pub struct Pdu<'a> {
     pub v3_msg_id: i32,
 }
 
+impl<'a> fmt::Debug for Pdu<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let community_str = String::from_utf8_lossy(self.community);
+        let mut ds = f.debug_struct("Pdu");
+        ds.field("version", &self.version)
+            .field("community", &community_str)
+            .field("message_type", &self.message_type)
+            .field("req_id", &self.req_id)
+            .field("error_status", &self.error_status)
+            .field("error_index", &self.error_index)
+            .field("varbinds", &self.varbinds)
+            .field("v1_trap_info", &self.v1_trap_info);
+
+        #[cfg(feature = "v3")]
+        ds.field("v3_msg_id", &self.v3_msg_id);
+
+        ds.finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct V1TrapInfo<'a> {
     pub enterprise: Oid<'a>,
@@ -527,6 +576,29 @@ pub struct V1TrapInfo<'a> {
 }
 
 impl<'a> Pdu<'a> {
+    pub fn new(
+        version: Version,
+        community: &'a [u8],
+        message_type: MessageType,
+        req_id: i32,
+        error_status: u32,
+        error_index: u32,
+        varbinds: Varbinds<'a>,
+    ) -> Pdu<'a> {
+        Pdu {
+            version: version as i64,
+            community,
+            message_type,
+            req_id,
+            error_status,
+            error_index,
+            varbinds,
+            v1_trap_info: None,
+            #[cfg(feature = "v3")]
+            v3_msg_id: 0,
+        }
+    }
+
     pub fn version(&self) -> Result<Version> {
         self.version.try_into()
     }

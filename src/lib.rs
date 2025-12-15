@@ -110,6 +110,8 @@ pub enum Error {
     Receive,
     /// MIB errors
     Mib(String),
+    /// OID parsing error
+    OidParseError,
 }
 
 impl fmt::Display for Error {
@@ -137,6 +139,7 @@ impl fmt::Display for Error {
             Error::Send => write!(f, "Socket send error"),
             Error::Receive => write!(f, "Socket receive error"),
             Error::Mib(ref s) => write!(f, "MIB error: {}", s),
+            Error::OidParseError => write!(f, "OID parsing error"),
         }
     }
 }
@@ -156,10 +159,17 @@ impl From<std::num::TryFromIntError> for Error {
     }
 }
 
-type Result<T> = std::result::Result<T, Error>;
+impl From<asn1_rs::OidParseError> for Error {
+    fn from(_: asn1_rs::OidParseError) -> Error {
+        Error::OidParseError
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 const BUFFER_SIZE: usize = 65_507;
 
+#[derive(Clone)]
 pub enum Value<'a> {
     Boolean(bool),
     Null,
@@ -223,6 +233,90 @@ impl fmt::Debug for Value<'_> {
             Value::InformRequest(ref val) => write!(f, "SNMP INFORM REQUEST: {:#?}", val),
             Value::Trap(ref val) => write!(f, "SNMP TRAP: {:#?}", val),
             Value::Report(ref val) => write!(f, "SNMP REPORT: {:#?}", val),
+        }
+    }
+}
+
+/// Owned variant of Value that owns all its data.
+/// This is useful for storing SNMP values long-term without lifetime constraints.
+#[derive(Clone, Debug)]
+pub enum ValueOwned {
+    Boolean(bool),
+    Null,
+    Integer(i64),
+    OctetString(Vec<u8>),
+    ObjectIdentifier(Vec<u64>), // OID arcs
+
+    IpAddress([u8; 4]),
+    Counter32(u32),
+    Unsigned32(u32),
+    Timeticks(u32),
+    Opaque(Vec<u8>),
+    Counter64(u64),
+
+    EndOfMibView,
+    NoSuchObject,
+    NoSuchInstance,
+}
+
+impl ValueOwned {
+    /// Convert owned value to borrowed Value with lifetime 'a.
+    /// For OctetString and Opaque, this requires external storage to hold the data.
+    pub fn to_borrowed<'a>(&'a self) -> Value<'a> {
+        match self {
+            ValueOwned::Boolean(v) => Value::Boolean(*v),
+            ValueOwned::Null => Value::Null,
+            ValueOwned::Integer(v) => Value::Integer(*v),
+            ValueOwned::OctetString(v) => Value::OctetString(v.as_slice()),
+            ValueOwned::ObjectIdentifier(arcs) => {
+                // Create Oid from arcs - this may fail if invalid
+                match Oid::from(arcs.as_slice()) {
+                    Ok(oid) => Value::ObjectIdentifier(oid), // OK: Oid::from should only fail for empty slices or if arcs contains values > 2^32-1
+                    // Fallback for invalid OID
+                    Err(_) => Value::Null,
+                    // Err(e) => panic!(
+                    //     "Invalid OID arcs stored in ValueOwned::ObjectIdentifier: {:?}",
+                    //     e
+                    // ),
+                }
+            }
+            ValueOwned::IpAddress(v) => Value::IpAddress(*v),
+            ValueOwned::Counter32(v) => Value::Counter32(*v),
+            ValueOwned::Unsigned32(v) => Value::Unsigned32(*v),
+            ValueOwned::Timeticks(v) => Value::Timeticks(*v),
+            ValueOwned::Opaque(v) => Value::Opaque(v.as_slice()),
+            ValueOwned::Counter64(v) => Value::Counter64(*v),
+            ValueOwned::EndOfMibView => Value::EndOfMibView,
+            ValueOwned::NoSuchObject => Value::NoSuchObject,
+            ValueOwned::NoSuchInstance => Value::NoSuchInstance,
+        }
+    }
+}
+
+impl<'a> Value<'a> {
+    /// Convert borrowed Value to owned ValueOwned by cloning all data.
+    pub fn to_owned(&self) -> Result<ValueOwned> {
+        match self {
+            Value::Boolean(v) => Ok(ValueOwned::Boolean(*v)),
+            Value::Null => Ok(ValueOwned::Null),
+            Value::Integer(v) => Ok(ValueOwned::Integer(*v)),
+            Value::OctetString(bytes) => Ok(ValueOwned::OctetString(bytes.to_vec())),
+            Value::ObjectIdentifier(oid) => {
+                let arcs: Vec<u64> = oid.iter().ok_or(Error::AsnParse)?.collect();
+                Ok(ValueOwned::ObjectIdentifier(arcs))
+            }
+            Value::IpAddress(v) => Ok(ValueOwned::IpAddress(*v)),
+            Value::Counter32(v) => Ok(ValueOwned::Counter32(*v)),
+            Value::Unsigned32(v) => Ok(ValueOwned::Unsigned32(*v)),
+            Value::Timeticks(v) => Ok(ValueOwned::Timeticks(*v)),
+            Value::Opaque(bytes) => Ok(ValueOwned::Opaque(bytes.to_vec())),
+            Value::Counter64(v) => Ok(ValueOwned::Counter64(*v)),
+            Value::EndOfMibView => Ok(ValueOwned::EndOfMibView),
+            Value::NoSuchObject => Ok(ValueOwned::NoSuchObject),
+            Value::NoSuchInstance => Ok(ValueOwned::NoSuchInstance),
+
+            // Complex types (Sequence, Set, Constructed, PDU types) cannot be converted
+            _ => Err(Error::AsnUnsupportedType),
         }
     }
 }
@@ -359,6 +453,20 @@ impl<'a> Varbinds<'a> {
         Varbinds {
             inner: AsnReader::from_bytes(bytes),
         }
+    }
+
+    pub fn from_vec(vec: Vec<(Oid<'a>, Value<'a>)>) -> Varbinds<'a> {
+        let bytes = pdu::varbinds_from_vec(&vec);
+        let leaked = Box::leak(bytes.into_boxed_slice());
+        Varbinds {
+            inner: AsnReader::from_bytes(leaked),
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (Oid<'a>, Value<'a>)> {
+        // Clone the reader so callers can iterate without consuming `self`.
+        self.clone()
     }
 }
 
